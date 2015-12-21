@@ -1,0 +1,203 @@
+
+(* @NESTEDCOMMENTS := 'Yes' *)
+(* @PATH := '\/Plant_Objects' *)
+(* @OBJECTFLAGS := '0, 8' *)
+(* @SYMFILEFLAGS := '2048' *)
+FUNCTION_BLOCK obj_CAL_Generica
+VAR_INPUT
+
+	(* Settings *)
+	ID				: BYTE;
+
+	(* Segnali di ingresso per interfaccia  da ingressi Digitali *)
+	ALARM_CAL: BOOL;
+	STATO_CAL: BOOL;
+	BLOCCO_CAL: BOOL;
+	(* per Gestione controolo regolazione Caldaia *)
+
+	RUN  			: BOOL;		(* Control input *)
+	TEMP 			: INT;			(* Variabile di Processo*)
+	FEEDBACK	: WORD;		(* Feedback controllo  *)
+
+	Ctrl_Init		: BOOL;
+	Ctrl_SetPoint	: INT;
+	Ctrl_Err		: INT;			(* Current error *)
+	Ctrl_Err0		: INT; 			(* Previous error *)
+	Ctrl_Accel		: REAL;		(* Derivate of error *)
+	Ctrl_AccelGate  : INT:=1;		(* Derivate gate *)
+	Ctrl_AccelTmr	: WORD;
+	Ctrl_ErrGate	: INT:=1;		(* Error gate *)
+	Ctrl_Kp			: REAL:=1;		(* Proportional factor *)
+	Ctrl_Kd			: REAL:=100;  	(* Derivative factor *)
+	Ctrl_Out		: REAL;
+
+	Chk_Err			: INT;
+	Chk_ErrGate		: INT:=20; 		(* Check error gate *)
+	Chk_Cnt			: INT;
+	Chk_CntAlarm	: INT:=60; 		(* Check error trigger 60s *)
+
+
+	Plant_CAL_TMax		: INT ;				(* [.1°C]  Massima temperatura ammessa sul Set Point *)
+	Plant_CAL_TDefault	: INT;				(* [.1°C] Temperatura di default in caso di errore climatica *)
+
+	Plant_CAL_TStart		: INT:=180 ;		(* [.1°C]  Temperatura Start Caldaia sul Set Point *)
+
+
+	Rearm:BOOL;
+
+
+END_VAR
+VAR_OUTPUT
+	(* Status *)
+	Status_Log	: BYTE;
+	Status_Vis 	: DWORD;
+
+	(* riferimento di uscita *)
+	AO_OUT:WORD;
+	DO_STOP_CALDAIA:BOOL;
+	DO_START_CALDAIA:BOOL;
+	DO_RIARMO:BOOL;
+
+END_VAR
+VAR_IN_OUT
+	CLIM		  : typ_Clima;
+END_VAR
+VAR
+	fALARM_CAL: FLT_TAP;
+	fSTATO_CAL: FLT_TAP;
+
+	Alarm: BOOL;
+	Warning:BOOL;
+
+	Curve 		: CHARCURVE;
+	Curve_Err 	: BYTE;
+	Curve_Temp	: INT;
+
+	TP_RIARMO: TP:=(PT:=t#5s);
+
+
+END_VAR
+
+(* @END_DECLARATION := '0' *)
+(*Segnalzione Allarme CALDAIA *)
+
+fALARM_CAL(IN:=ALARM_CAL);
+IF fALARM_CAL.EVH THEN
+	IF NOT Alarm THEN
+		Alarm:=TRUE;
+		LogEv(EL_Alarm,EO_CAL,ID,4,'CALDAIA_IN_BLOCCO ');    (******************************segnalazione *******************************)
+	END_IF
+ELSE
+	Alarm:=FALSE;
+END_IF
+
+
+(* Stato CALDAIA *)
+fSTATO_CAL(IN:=STATO_CAL);
+IF fSTATO_CAL.EVH THEN
+	LogEv(EL_Log,EO_CAL,ID,1,'CALDAIA_OK');
+END_IF
+IF fSTATO_CAL.EVL THEN
+	LogEv(EL_Log,EO_CAL,1,2,'CALDAIA_KO');
+END_IF
+
+
+(* Check climatic setup *)
+IF NOT CLIM.InitOK THEN Clima_Default(); END_IF;
+(* Calculate Setpoint *)
+Curve(	IN:= TAMB.T,	N:= 5, P:= CLIM.Points,
+		OUT=> Ctrl_SetPoint, ERR=> Curve_Err );
+IF Curve_Err>0  OR Ctrl_SetPoint>Plant_CAL_TMax THEN
+	Ctrl_SetPoint:=Plant_CAL_TDefault;
+	IF NOT Warning THEN
+		Warning:=TRUE;
+		LogEv(EL_Wrn,EO_CAL,ID,2,'Climatic_Error');
+	END_IF
+ELSE
+	Warning:=FALSE;
+END_IF
+
+
+(***** regolazione caldaia in funzione del Set Point appena passato con la curva Clima *************)
+
+(* Execute control loop [T=500ms] *)
+IF RUN AND (NOT Alarm) THEN
+	(* Calculate error *)
+	Ctrl_Err:=Ctrl_SetPoint-TEMP;
+	(* Init/restart operations *)
+	IF NOT Ctrl_Init THEN
+		Ctrl_Accel:=0;
+		Ctrl_AccelTmr:=0;
+		Ctrl_Err0:=Ctrl_Err;
+		Ctrl_Out:=5000;
+		Ctrl_Init:=TRUE;
+	END_IF
+	(* Calculate acceleration *)
+	IF ABS(Ctrl_Err-Ctrl_Err0)>Ctrl_AccelGate OR Ctrl_AccelTmr>20 THEN
+		Ctrl_Accel:=INT_TO_REAL(Ctrl_Err-Ctrl_Err0)/WORD_TO_REAL(1+Ctrl_AccelTmr);
+		Ctrl_AccelTmr:=0;
+		Ctrl_Err0:=Ctrl_Err;
+	ELSE
+		Ctrl_AccelTmr:=Ctrl_AccelTmr+1;
+	END_IF
+	(* Gate error *)
+	IF ABS(Ctrl_Err)>Ctrl_ErrGate THEN
+		(* Control loop *)
+		Ctrl_Out:=Ctrl_Out+(Ctrl_Kp*Ctrl_Err)+(Ctrl_Kd*Ctrl_Accel);
+	END_IF
+	(* Limiter and Output *)
+	Ctrl_Out:=LIMIT(0,Ctrl_Out,32767);
+	AO_OUT:=REAL_TO_WORD(Ctrl_Out);
+ELSE
+	Ctrl_Init:=FALSE;
+	AO_OUT:=0;
+END_IF
+
+(* Controllo On/Off Caldaia *)
+(* Set running flag *)
+IF Ctrl_SetPoint<Plant_CAL_TStart THEN
+		 DO_START_CALDAIA:=FALSE;
+
+ ELSE
+		DO_START_CALDAIA:=TRUE;
+END_IF
+
+
+(** Riarmo Reset Caldaia  ***)
+
+TP_RIARMO(IN:=Rearm );
+DO_RIARMO:=TP_RIARMO.Q;
+Rearm:=TP_RIARMO.Q;
+
+
+
+
+
+(* Status color *)
+  IF Alarm OR BLOCCO_CAL THEN
+		Status_Log:=2; Status_Vis:=16#2020F0;
+		AO_OUT:=0;
+ELSIF Warning  THEN Status_Log:=1; Status_Vis:=16#20F0F0;
+             	ELSE
+				Status_Log:=0;
+				Status_Vis:=16#006000;
+END_IF
+
+
+
+(* Aggiornamento Stato Lampada Segnalazione Allarme *)
+Lamp.obj_Status := Status_Log;     (* Passo lo Status_Log dell'oggetto come input del blocco per la gestione della spia *)
+Lamp.UpdateStatus();               (* Procedo con l'aggiornamento vero e proprio dello stato globale *)
+
+
+END_FUNCTION_BLOCK
+ACTION	Clima_Default:
+CLIM.Points[0].X:=-300; CLIM.Points[0].Y:=650;
+CLIM.Points[1].X:=-50 ; CLIM.Points[1].Y:=650;
+CLIM.Points[2].X:= 200; CLIM.Points[2].Y:=200;
+CLIM.Points[3].X:= 300; CLIM.Points[3].Y:=200;
+CLIM.Points[4].X:= 500; CLIM.Points[4].Y:=200;
+CLIM.InitOK:=TRUE;
+LogEv(EL_Wrn,EO_CAL,ID,1,'Climatic_default');
+END_ACTION
+
